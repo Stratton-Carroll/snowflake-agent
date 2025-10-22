@@ -5,7 +5,30 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
-ArtifactType = Literal["table", "chart", "json", "text"]
+ArtifactType = Literal["table", "chart", "json", "text", "metrics", "insight"]
+
+
+class VisualizationSpec(BaseModel):
+    """Structured specification for rendering interactive charts."""
+
+    library: Literal["vega-lite"] = Field(description="Visualization grammar to interpret the spec.")
+    spec: Dict[str, Any] = Field(description="Visualization schema (e.g. Vega-Lite JSON).")
+    interactive: bool = Field(default=True, description="Whether the chart should enable interactive behaviours.")
+
+
+class KeyFigure(BaseModel):
+    """Single value surfaced as part of an insight card."""
+
+    label: str = Field(description="Short descriptor displayed above or beside the value.")
+    value: str = Field(description="Formatted metric value shown to the user.")
+    change: Optional[str] = Field(
+        default=None,
+        description="Optional change indicator (e.g. +5% YoY).",
+    )
+    annotation: Optional[str] = Field(
+        default=None,
+        description="Optional footnote or additional context for the figure.",
+    )
 
 
 class ArtifactPayload(BaseModel):
@@ -15,6 +38,14 @@ class ArtifactPayload(BaseModel):
     schema: Optional[Dict[str, Any]] = Field(
         default=None, description="Optional schema or metadata describing the payload shape."
     )
+    visualization: Optional[VisualizationSpec] = Field(
+        default=None, description="Optional visualization configuration rendered on the frontend."
+    )
+    key_figures: List[KeyFigure] = Field(
+        default_factory=list,
+        description="Optional headline metrics to spotlight alongside the artifact.",
+    )
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional render hints or statistics.")
 
 
 class ChatArtifact(BaseModel):
@@ -26,6 +57,7 @@ class ChatArtifact(BaseModel):
     description: Optional[str] = Field(
         default=None, description="Longer description or insight summary to show with the artifact."
     )
+    headline: Optional[str] = Field(default=None, description="Primary takeaway sentence emphasised in the UI.")
     payload: ArtifactPayload = Field(default_factory=ArtifactPayload)
 
 

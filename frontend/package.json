@@ -12,7 +12,11 @@
   "dependencies": {
     "axios": "^1.6.8",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "react-vega": "^7.7.0",
+    "vega": "^5.25.0",
+    "vega-lite": "^5.16.3",
+    "vega-tooltip": "^0.32.0"
   },
   "devDependencies": {
     "@types/react": "^18.2.64",

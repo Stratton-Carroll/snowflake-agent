@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 import logging
 from typing import Any, Dict, List, Protocol
 from uuid import uuid4
 
-from app.schemas.chat import ArtifactPayload, ChatArtifact, ChatRequest, ChatResponse
+from app.schemas.chat import ArtifactPayload, ChatArtifact, ChatRequest, ChatResponse, KeyFigure, VisualizationSpec
 from app.services.mcp_client import SnowflakeMcpClient
 from app.services.openai_client import OpenAIClient
 from app.services.session_store import Message, SessionStore
@@ -175,9 +176,9 @@ class ChatOrchestrator:
                     continue
 
                 last_sql = statement
-                tool_result, artifact = await self._invoke_snowflake(statement, warnings)
-                if artifact:
-                    run_artifacts.append(artifact)
+                tool_result, generated_artifacts = await self._invoke_snowflake(statement, warnings)
+                if generated_artifacts:
+                    run_artifacts.extend(generated_artifacts)
                 tool_response_message = {
                     "role": "tool",
                     "tool_call_id": tool_call.get("id"),
@@ -192,14 +193,16 @@ class ChatOrchestrator:
             last_sql=last_sql,
         )
 
-    async def _invoke_snowflake(self, statement: str, warnings: List[str]) -> tuple[Dict[str, Any], ChatArtifact | None]:
+    async def _invoke_snowflake(
+        self, statement: str, warnings: List[str]
+    ) -> tuple[Dict[str, Any], List[ChatArtifact]]:
         """Execute SQL via the Snowflake MCP client and shape results for the model and UI."""
         try:
             result = await self._mcp_client.run_query(statement)
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.exception("Snowflake query failed for statement: %s", statement)
             warnings.append("Snowflake query failed; see logs for details.")
-            return {"status": "error", "message": str(exc)}, None
+            return {"status": "error", "message": str(exc)}, []
 
         columns = result.get("columns", [])
         rows = result.get("rows", [])
@@ -212,8 +215,8 @@ class ChatOrchestrator:
             "rows": limited_rows,
         }
 
-        artifact = convert_query_result(result, statement)
-        return tool_payload, artifact
+        artifacts = build_artifacts_from_result(result, statement)
+        return tool_payload, artifacts
 
 
 class CompletionContext:
@@ -270,13 +273,13 @@ def extract_statement(arguments: Any, warnings: List[str]) -> str | None:
     return statement.strip()
 
 
-def convert_query_result(result: dict, statement: str) -> ChatArtifact | None:
-    """Convert an MCP query result into a ChatArtifact for the frontend."""
+def build_artifacts_from_result(result: dict, statement: str) -> List[ChatArtifact]:
+    """Convert an MCP query result into one or more ChatArtifacts for the frontend."""
     columns = result.get("columns")
     rows = result.get("rows")
 
     if not isinstance(columns, list) or not isinstance(rows, list):
-        return None
+        return []
 
     records: List[dict] = []
     for row in rows:
@@ -285,15 +288,191 @@ def convert_query_result(result: dict, statement: str) -> ChatArtifact | None:
         record = {column: row[index] if index < len(row) else None for index, column in enumerate(columns)}
         records.append(record)
 
+    if not records:
+        return []
+
     artifact_id = str(uuid4())
     truncated_statement = statement.replace("\n", " ").strip()
     if len(truncated_statement) > 120:
         truncated_statement = truncated_statement[:117] + "..."
 
-    return ChatArtifact(
+    table_artifact = ChatArtifact(
         id=artifact_id,
         type="table",
         title="Snowflake Query Result",
         description=f"Result of `{truncated_statement}`",
         payload=ArtifactPayload(data=records, schema={"columns": columns}),
     )
+
+    metrics_artifact = build_metrics_artifact(columns, records, truncated_statement)
+    chart_artifact = build_chart_artifact(columns, records, truncated_statement)
+
+    artifacts: List[ChatArtifact] = [table_artifact]
+    if metrics_artifact:
+        artifacts.insert(0, metrics_artifact)
+    if chart_artifact:
+        artifacts.insert(1 if metrics_artifact else 0, chart_artifact)
+    return artifacts
+
+
+def build_metrics_artifact(columns: List[str], records: List[dict], statement: str) -> ChatArtifact | None:
+    """Construct a metrics artifact by extracting headline figures from tabular data."""
+    if not records:
+        return None
+
+    sample_row = _first_non_empty(records)
+    numeric_columns = [
+        column
+        for column in columns
+        if isinstance(sample_row.get(column), (int, float)) and not isinstance(sample_row.get(column), bool)
+    ]
+    if not numeric_columns:
+        return None
+
+    top_row = sample_row
+    key_figures = [
+        KeyFigure(
+            label=column.replace("_", " ").title(),
+            value=f"{top_row.get(column):,.2f}" if isinstance(top_row.get(column), float) else str(top_row.get(column)),
+        )
+        for column in numeric_columns[:3]
+    ]
+
+    headline = None
+    descriptor_columns = [column for column in columns if column not in numeric_columns]
+    if descriptor_columns:
+        descriptor = top_row.get(descriptor_columns[0])
+        if descriptor is not None:
+            headline = f"Top result: {descriptor}"
+
+    return ChatArtifact(
+        id=str(uuid4()),
+        type="metrics",
+        title="Headline Metrics",
+        headline=headline,
+        description=f"Quick view of leading figures from `{statement}`",
+        payload=ArtifactPayload(
+            data=None,
+            key_figures=key_figures,
+            metadata={"source": "snowflake"},
+        ),
+    )
+
+
+def build_chart_artifact(columns: List[str], records: List[dict], statement: str) -> ChatArtifact | None:
+    """Create a Vega-Lite visualization spec when the dataset supports charting."""
+    if not records:
+        return None
+
+    sample_row = _first_non_empty(records)
+    numeric_columns = [
+        column
+        for column in columns
+        if isinstance(sample_row.get(column), (int, float)) and not isinstance(sample_row.get(column), bool)
+    ]
+    if not numeric_columns:
+        return None
+
+    temporal_columns = [
+        column
+        for column in columns
+        if _is_temporal(sample_row.get(column)) or column.lower() in {"dt", "date", "ts", "timestamp", "ts_15m_bucket"}
+    ]
+    categorical_columns = [
+        column
+        for column in columns
+        if column not in temporal_columns and not isinstance(sample_row.get(column), (int, float))
+    ]
+
+    chart_values = records[:500]
+    metric_field = numeric_columns[0]
+
+    if temporal_columns:
+        temporal_field = temporal_columns[0]
+        spec = {
+            "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+            "data": {"values": chart_values},
+            "mark": {"type": "line", "point": True, "interpolate": "monotone"},
+            "encoding": {
+                "x": {"field": temporal_field, "type": "temporal", "title": temporal_field.replace("_", " ").title()},
+                "y": {
+                    "field": metric_field,
+                    "type": "quantitative",
+                    "title": metric_field.replace("_", " ").title(),
+                },
+                "tooltip": [{"field": field, "type": _infer_vega_type(sample_row.get(field))} for field in columns[:6]],
+            },
+        }
+        if categorical_columns:
+            spec["encoding"]["color"] = {
+                "field": categorical_columns[0],
+                "type": "nominal",
+                "title": categorical_columns[0].replace("_", " ").title(),
+            }
+        headline = f"Trend of {metric_field.replace('_', ' ')} over time"
+    elif categorical_columns:
+        category_field = categorical_columns[0]
+        spec = {
+            "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+            "data": {"values": chart_values},
+            "mark": {"type": "bar"},
+            "encoding": {
+                "x": {
+                    "field": category_field,
+                    "type": "nominal",
+                    "sort": "-y",
+                    "title": category_field.replace("_", " ").title(),
+                },
+                "y": {
+                    "field": metric_field,
+                    "type": "quantitative",
+                    "title": metric_field.replace("_", " ").title(),
+                },
+                "tooltip": [{"field": field, "type": _infer_vega_type(sample_row.get(field))} for field in columns[:6]],
+            },
+        }
+        headline = f"{metric_field.replace('_', ' ').title()} by {category_field.replace('_', ' ').title()}"
+    else:
+        return None
+
+    return ChatArtifact(
+        id=str(uuid4()),
+        type="chart",
+        title="Visualization",
+        headline=headline,
+        description=f"Chart generated from `{statement}`",
+        payload=ArtifactPayload(
+            data=None,
+            visualization=VisualizationSpec(library="vega-lite", spec=spec),
+            metadata={"source": "snowflake"},
+        ),
+    )
+
+
+def _is_temporal(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (datetime,)):
+        return True
+    if isinstance(value, str):
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _infer_vega_type(value: Any) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "quantitative"
+    if _is_temporal(value):
+        return "temporal"
+    return "nominal"
+
+
+def _first_non_empty(records: List[dict]) -> dict:
+    for record in records:
+        if any(value is not None for value in record.values()):
+            return record
+    return records[0]

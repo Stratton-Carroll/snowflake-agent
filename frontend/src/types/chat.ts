@@ -1,8 +1,24 @@
-export type ArtifactType = "table" | "chart" | "json" | "text";
+export type ArtifactType = "table" | "chart" | "json" | "text" | "metrics" | "insight";
+
+export interface VisualizationSpec {
+  library: "vega-lite";
+  spec: Record<string, unknown>;
+  interactive?: boolean;
+}
+
+export interface KeyFigure {
+  label: string;
+  value: string;
+  change?: string;
+  annotation?: string;
+}
 
 export interface ArtifactPayload {
   data: unknown;
   schema?: Record<string, unknown>;
+  visualization?: VisualizationSpec | null;
+  key_figures?: KeyFigure[];
+  metadata?: Record<string, unknown>;
 }
 
 export interface ChatArtifact {
@@ -10,6 +26,7 @@ export interface ChatArtifact {
   type: ArtifactType;
   title?: string;
   description?: string;
+  headline?: string;
   payload: ArtifactPayload;
 }
 

@@ -1,0 +1,40 @@
+# macOS metadata
+.DS_Store
+
+# Environment files
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.egg
+*.log
+*.sqlite3
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Project-specific Python artifacts
+backend/snowflake_chatbot_backend.egg-info/
+
+# Node.js dependencies and build output
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+frontend/dist/
+frontend/.vite/
+
+# Editor settings
+.idea/
+.vscode/

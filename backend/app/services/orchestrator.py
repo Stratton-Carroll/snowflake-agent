@@ -45,6 +45,7 @@ SYSTEM_PROMPT = (
     "       GROUP BY 1\n"
     "     )\n"
     "     SELECT * FROM STATE_STATS ORDER BY AVG_NORMALIZED DESC LIMIT 10;\n"
+    "   Prefer analytic functions (e.g., LAG/LEAD) for day-over-day change instead of SUMMARY aliases; when aliasing, choose short lowercase tokens like curr_tbl or prev_tbl—never use reserved keywords such as CURRENT or PREVIOUS.\n"
     "\n"
     "3. Never invent numbers. Summaries must reference the SQL results you just retrieved. "
     "   If a query fails, explain the error and try a corrected query.\n"

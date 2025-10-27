@@ -55,6 +55,7 @@ export const useChatSession = (): UseChatSessionResult => {
           artifacts: data.artifacts,
           warnings: data.warnings,
           rawSql: data.raw_sql,
+          executionMetadata: data.execution_metadata ?? undefined,
           createdAt: new Date().toISOString(),
         };
 

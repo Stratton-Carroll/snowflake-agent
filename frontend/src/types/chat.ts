@@ -21,6 +21,14 @@ export interface ArtifactPayload {
   metadata?: Record<string, unknown>;
 }
 
+export interface ExecutionMetadata {
+  row_count?: number;
+  column_count?: number;
+  chart_types: string[];
+  query_duration_ms?: number;
+  generated_at: string;
+}
+
 export interface ChatArtifact {
   id: string;
   type: ArtifactType;
@@ -48,6 +56,7 @@ export interface ChatResponse {
   artifacts: ChatArtifact[];
   raw_sql?: string | null;
   warnings: string[];
+  execution_metadata?: ExecutionMetadata | null;
 }
 
 export type ChatRole = "user" | "assistant" | "system";
@@ -59,5 +68,6 @@ export interface ChatMessage {
   artifacts?: ChatArtifact[];
   warnings?: string[];
   rawSql?: string | null;
+  executionMetadata?: ExecutionMetadata | null;
   createdAt: string;
 }

@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime
 import logging
 from typing import Any, Dict, List, Protocol
 from uuid import uuid4
 
-from app.schemas.chat import ArtifactPayload, ChatArtifact, ChatRequest, ChatResponse, KeyFigure, VisualizationSpec
+from app.schemas.chat import (
+    ArtifactPayload,
+    ChatArtifact,
+    ChatRequest,
+    ChatResponse,
+    ExecutionMetadata,
+    KeyFigure,
+    VisualizationSpec,
+)
 from app.services.mcp_client import SnowflakeMcpClient
 from app.services.openai_client import OpenAIClient
 from app.services.session_store import Message, SessionStore
@@ -132,6 +141,7 @@ class ChatOrchestrator:
             artifacts=artifacts,
             raw_sql=raw_sql,
             warnings=warnings,
+            execution_metadata=completion_context.metadata,
         )
 
     async def _execute_with_tools(
@@ -143,6 +153,7 @@ class ChatOrchestrator:
         run_artifacts: List[ChatArtifact] = []
         last_sql: str | None = None
         openai_messages = list(messages)
+        latest_metadata: ExecutionMetadata | None = None
 
         for iteration in range(MAX_TOOL_ITERATIONS):
             completion = await self._openai_client.create_chat_completion(
@@ -162,7 +173,12 @@ class ChatOrchestrator:
                 if assistant_text is None:
                     raise RuntimeError("OpenAI response lacked assistant content.")
                 openai_messages.append({"role": "assistant", "content": assistant_text})
-                return CompletionContext(assistant_text=assistant_text, artifacts=run_artifacts, last_sql=last_sql)
+                return CompletionContext(
+                    assistant_text=assistant_text,
+                    artifacts=run_artifacts,
+                    last_sql=last_sql,
+                    metadata=latest_metadata,
+                )
 
             openai_messages.append(assistant_message)
 
@@ -177,9 +193,20 @@ class ChatOrchestrator:
                     continue
 
                 last_sql = statement
-                tool_result, generated_artifacts = await self._invoke_snowflake(statement, warnings)
+                tool_result, generated_artifacts, metadata = await self._invoke_snowflake(statement, warnings)
                 if generated_artifacts:
                     run_artifacts.extend(generated_artifacts)
+                if metadata:
+                    if latest_metadata:
+                        combined_charts = set(latest_metadata.chart_types)
+                        combined_charts.update(metadata.chart_types)
+                        latest_metadata.chart_types = list(combined_charts)
+                        latest_metadata.row_count = metadata.row_count or latest_metadata.row_count
+                        latest_metadata.column_count = metadata.column_count or latest_metadata.column_count
+                        latest_metadata.query_duration_ms = metadata.query_duration_ms
+                        latest_metadata.generated_at = metadata.generated_at
+                    else:
+                        latest_metadata = metadata
                 tool_response_message = {
                     "role": "tool",
                     "tool_call_id": tool_call.get("id"),
@@ -192,22 +219,28 @@ class ChatOrchestrator:
             assistant_text="I reached the tool call limit without producing a final answer.",
             artifacts=run_artifacts,
             last_sql=last_sql,
+            metadata=latest_metadata,
         )
 
     async def _invoke_snowflake(
         self, statement: str, warnings: List[str]
-    ) -> tuple[Dict[str, Any], List[ChatArtifact]]:
+    ) -> tuple[Dict[str, Any], List[ChatArtifact], ExecutionMetadata | None]:
         """Execute SQL via the Snowflake MCP client and shape results for the model and UI."""
+        start_time = time.perf_counter()
         try:
             result = await self._mcp_client.run_query(statement)
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.exception("Snowflake query failed for statement: %s", statement)
             warnings.append("Snowflake query failed; see logs for details.")
-            return {"status": "error", "message": str(exc)}, []
+            return {"status": "error", "message": str(exc)}, [], None
+        finally:
+            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
 
         columns = result.get("columns", [])
         rows = result.get("rows", [])
         limited_rows = rows[:MAX_ROWS_FOR_MODEL] if isinstance(rows, list) else []
+        row_count = len(rows) if isinstance(rows, list) else None
+        column_count = len(columns) if isinstance(columns, list) else None
 
         tool_payload: Dict[str, Any] = {
             "status": "success",
@@ -217,16 +250,35 @@ class ChatOrchestrator:
         }
 
         artifacts = build_artifacts_from_result(result, statement)
-        return tool_payload, artifacts
+        chart_types = [
+            artifact.payload.metadata.get("chart_type")
+            for artifact in artifacts
+            if artifact.type == "chart" and artifact.payload.metadata.get("chart_type")
+        ]
+
+        metadata = ExecutionMetadata(
+            row_count=row_count,
+            column_count=column_count,
+            chart_types=chart_types,
+            query_duration_ms=elapsed_ms,
+        )
+        return tool_payload, artifacts, metadata
 
 
 class CompletionContext:
     """Container for the assistant outcome after orchestrating tool usage."""
 
-    def __init__(self, assistant_text: str, artifacts: List[ChatArtifact], last_sql: str | None) -> None:
+    def __init__(
+        self,
+        assistant_text: str,
+        artifacts: List[ChatArtifact],
+        last_sql: str | None,
+        metadata: ExecutionMetadata | None,
+    ) -> None:
         self.assistant_text = assistant_text
         self.artifacts = artifacts
         self.last_sql = last_sql
+        self.metadata = metadata
 
 
 def build_openai_messages(history: List[Message]) -> List[Dict[str, Any]]:
@@ -302,7 +354,15 @@ def build_artifacts_from_result(result: dict, statement: str) -> List[ChatArtifa
         type="table",
         title="Snowflake Query Result",
         description=f"Result of `{truncated_statement}`",
-        payload=ArtifactPayload(data=records, schema={"columns": columns}),
+        payload=ArtifactPayload(
+            data=records,
+            schema={"columns": columns},
+            metadata={
+                "source": "snowflake",
+                "row_count": len(records),
+                "column_count": len(columns),
+            },
+        ),
     )
 
     metrics_artifact = build_metrics_artifact(columns, records, truncated_statement)
@@ -355,7 +415,10 @@ def build_metrics_artifact(columns: List[str], records: List[dict], statement: s
         payload=ArtifactPayload(
             data=None,
             key_figures=key_figures,
-            metadata={"source": "snowflake"},
+            metadata={
+                "source": "snowflake",
+                "row_count": len(records),
+            },
         ),
     )
 
@@ -403,7 +466,7 @@ def build_chart_artifact(columns: List[str], records: List[dict], statement: str
                 },
                 "tooltip": [{"field": field, "type": _infer_vega_type(sample_row.get(field))} for field in columns[:6]],
             },
-        }
+            }
         if categorical_columns:
             spec["encoding"]["color"] = {
                 "field": categorical_columns[0],
@@ -411,6 +474,7 @@ def build_chart_artifact(columns: List[str], records: List[dict], statement: str
                 "title": categorical_columns[0].replace("_", " ").title(),
             }
         headline = f"Trend of {metric_field.replace('_', ' ')} over time"
+        chart_type = "line"
     elif categorical_columns:
         category_field = categorical_columns[0]
         spec = {
@@ -433,8 +497,28 @@ def build_chart_artifact(columns: List[str], records: List[dict], statement: str
             },
         }
         headline = f"{metric_field.replace('_', ' ').title()} by {category_field.replace('_', ' ').title()}"
+        chart_type = "bar"
     else:
         return None
+
+    spec["height"] = 340
+    spec["autosize"] = {"type": "fit", "contains": "padding"}
+    spec["selection"] = {
+        "highlight": {"type": "single", "on": "mouseover", "clear": "mouseout"},
+        "select": {"type": "multi", "toggle": "event.shiftKey"},
+    }
+    spec["config"] = {
+        "background": "transparent",
+        "axis": {
+            "labelColor": "#cbd5f5",
+            "titleColor": "#cbd5f5",
+            "gridColor": "#1f2945",
+            "domainColor": "#3b82f6",
+        },
+        "legend": {"labelColor": "#e2e8f0", "titleColor": "#cbd5f5"},
+        "view": {"stroke": "#1f2945"},
+        "point": {"filled": True, "size": 70, "color": "#60a5fa"},
+    }
 
     return ChatArtifact(
         id=str(uuid4()),
@@ -445,7 +529,12 @@ def build_chart_artifact(columns: List[str], records: List[dict], statement: str
         payload=ArtifactPayload(
             data=None,
             visualization=VisualizationSpec(library="vega-lite", spec=spec),
-            metadata={"source": "snowflake"},
+            metadata={
+                "source": "snowflake",
+                "chart_type": chart_type,
+                "metric": metric_field,
+                "record_sample": min(len(chart_values), len(records)),
+            },
         ),
     )
 

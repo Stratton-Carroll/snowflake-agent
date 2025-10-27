@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -61,6 +62,19 @@ class ChatArtifact(BaseModel):
     payload: ArtifactPayload = Field(default_factory=ArtifactPayload)
 
 
+class ExecutionMetadata(BaseModel):
+    """Additional details about Snowflake execution surfaced to the frontend."""
+
+    row_count: Optional[int] = Field(default=None, description="Total rows returned by the executed SQL.")
+    column_count: Optional[int] = Field(default=None, description="Number of columns present in the result set.")
+    chart_types: List[str] = Field(default_factory=list, description="List of chart types generated for this result.")
+    query_duration_ms: Optional[int] = Field(default=None, description="Duration of the Snowflake query in milliseconds.")
+    generated_at: datetime = Field(
+        default_factory=datetime.utcnow,
+        description="Timestamp when the execution metadata was recorded (UTC).",
+    )
+
+
 class ClientContext(BaseModel):
     """Optional metadata sent by the frontend to inform backend orchestration."""
 
@@ -94,3 +108,7 @@ class ChatResponse(BaseModel):
         description="SQL statement executed against Snowflake, when applicable.",
     )
     warnings: List[str] = Field(default_factory=list, description="Non-fatal warnings produced during processing.")
+    execution_metadata: Optional[ExecutionMetadata] = Field(
+        default=None,
+        description="Metadata about the executed SQL such as row count and duration.",
+    )
